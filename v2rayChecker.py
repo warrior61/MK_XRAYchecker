@@ -48,6 +48,11 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from types import SimpleNamespace
 from threading import Lock
 
+try:
+    from art import text2art
+except ImportError:
+    text2art = None
+
 import urllib3
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
@@ -156,7 +161,10 @@ DEFAULT_CONFIG = {
     "output_file": "sortedProxy.txt", # имя файла с отфильтрованными проксями
     "core_startup_timeout": 2.5, # Максимальное время ожидания старта ядра(ну если тупит)
     "core_kill_delay": 0.05,     # Задержка после УБИЙСТВА
+    "speed_test_url": "https://speed.cloudflare.com/__down?bytes=10000000", # ссылка для замеров
     "shuffle": False,
+    "check_speed": False,
+    "sort_by": "ping", # ping | speed
     "sources": DEFAULT_SOURCES # Ссылки с проксями
 }
 
@@ -172,9 +180,26 @@ def load_config():
     try:
         with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
             user_config = json.load(f)
-            config = DEFAULT_CONFIG.copy()
-            config.update(user_config)
-            return config
+        
+        config = DEFAULT_CONFIG.copy()
+        
+        config.update(user_config)
+        
+        has_new_keys = False
+        for key in DEFAULT_CONFIG:
+            if key not in user_config:
+                has_new_keys = True
+                break
+        
+        if has_new_keys:
+            try:
+                print(f">> Обновление {CONFIG_FILE}: добавлены новые параметры...")
+                with open(CONFIG_FILE, 'w', encoding='utf-8') as f:
+                    json.dump(config, f, indent=4)
+            except Exception as e:
+                print(f"Warning: Не удалось обновить конфиг файл: {e}")
+
+        return config
     except Exception as e:
         print(f"Error loading config: {e}")
         return DEFAULT_CONFIG
@@ -191,15 +216,35 @@ URL_FINDER = re.compile(
 )
 
 try:
-    from colorama import Fore, Style, init
-    init(autoreset=True)
+    from rich.console import Console
+    from rich.panel import Panel
+    from rich.table import Table
+    from rich.progress import Progress, SpinnerColumn, BarColumn, TextColumn, TimeElapsedColumn, TimeRemainingColumn
+    from rich.prompt import Prompt, Confirm
+    from rich.logging import RichHandler
+    from rich import box
+    from rich.text import Text
+    console = Console()
 except ImportError:
-    class Fore:
-        CYAN = GREEN = RED = YELLOW = RESET = MAGENTA = BLUE = WHITE = LIGHTBLACK_EX = ""
-        LIGHTGREEN_EX = LIGHTRED_EX = LIGHTYELLOW_EX = LIGHTCYAN_EX = LIGHTMAGENTA_EX = ""
-    class Style:
-        BRIGHT = RESET_ALL = ""
-    def init(autoreset=True): pass
+    print("Пожалуйста, установите библиотеку rich: pip install rich")
+    sys.exit(1)
+
+class Fore:
+    CYAN = "[cyan]"
+    GREEN = "[green]"
+    RED = "[red]"
+    YELLOW = "[yellow]"
+    MAGENTA = "[magenta]"
+    BLUE = "[blue]"
+    WHITE = "[white]"
+    LIGHTBLACK_EX = "[dim]"
+    LIGHTGREEN_EX = "[bold green]"
+    LIGHTRED_EX = "[bold red]"
+    RESET = "[/]"
+
+class Style:
+    BRIGHT = "[bold]"
+    RESET_ALL = "[/]"
 
 def clean_url(url):
     url = url.strip()
@@ -209,6 +254,7 @@ def clean_url(url):
 
 ANSI_ESCAPE = re.compile(r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])')
 
+    
 class SmartLogger:
     def __init__(self, filename="checker_history.log"):
         self.filename = filename
@@ -217,15 +263,15 @@ class SmartLogger:
             with open(self.filename, 'a', encoding='utf-8') as f:
                 f.write(f"\n{'-'*30} NEW SESSION {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} {'-'*30}\n")
         except Exception as e:
-            print(f"Ошибка создания лога: {e}")
+            console.print(f"[bold red]Ошибка создания лога: {e}[/]")
 
-    def log(self, msg):
+    def log(self, msg, style=None):
         with self.lock:
-            print(msg)
+            console.print(msg, style=style, highlight=False)
 
             try:
-                clean_msg = ANSI_ESCAPE.sub('', msg)
-                clean_msg = clean_msg.strip()
+                text_obj = Text.from_markup(str(msg))
+                clean_msg = text_obj.plain.strip()
                 
                 if clean_msg:
                     timestamp = datetime.now().strftime("[%H:%M:%S]")
@@ -248,7 +294,12 @@ OS_SYSTEM = platform.system().lower()
 CORE_PATH = ""
 CTRL_C = False
 
-LOGO_ASCII = r"""
+LOGO_FONTS = [
+    "cybermedium",
+    "4Max"
+]
+
+BACKUP_LOGO = r"""
 +═════════════════════════════════════════════════════════════════════════+
 ║      ███▄ ▄███▓ ██ ▄█▀ █    ██  ██▓    ▄▄▄█████▓ ██▀███   ▄▄▄           ║
 ║     ▓██▒▀█▀ ██▒ ██▄█▒  ██  ▓██▒▓██▒    ▓  ██▒ ▓▒▓██ ▒ ██▒▒████▄         ║
@@ -610,7 +661,6 @@ def parse_hysteria2(url):
         }
     except: return None
 
-    
 def get_proxy_tag(url):
     try:
         url = clean_url(url)
@@ -811,8 +861,42 @@ def check_connection(local_port, domain, timeout):
         return False, "Handshake Fail"
     except Exception as e:
         return False, str(e)
+    
+def check_speed_download(local_port, url_file, timeout=12):
+    proxies = {
+        'http': f'socks5://127.0.0.1:{local_port}',
+        'https': f'socks5://127.0.0.1:{local_port}'
+    }
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+    }
+    try:
+        start_time = time.time()
+        with requests.get(url_file, proxies=proxies, headers=headers, stream=True, timeout=timeout, verify=False) as r:
+            r.raise_for_status()
+            total_bytes = 0
+            limit_bytes = 10 * 1024 * 1024
+            
+            for chunk in r.iter_content(chunk_size=16384):
+                if chunk:
+                    total_bytes += len(chunk)
+                if time.time() - start_time > timeout or total_bytes >= limit_bytes:
+                    break
+        
+        duration = time.time() - start_time
+        if duration <= 0: duration = 0.1
+        
+        if total_bytes < 10240:
+            return 0.0
+            
+        speed_bps = total_bytes / duration
+        speed_mbps = speed_bps / 125000 
+        
+        return round(speed_mbps, 2)
+    except Exception:
+        return 0.0
 
-def Checker(proxyList, localPort, testDomain, timeOut, t2exec, t2kill):
+def Checker(proxyList, localPort, testDomain, timeOut, t2exec, t2kill, checkSpeed=False, speedUrl="", sortBy="ping"):
     liveProxy = []
     
     for url in proxyList:
@@ -838,7 +922,7 @@ def Checker(proxyList, localPort, testDomain, timeOut, t2exec, t2kill):
             if proc.poll() is not None:
                 safe_print(f"{Fore.RED}[Dead] {tag[:15]}.. -> Core crashed{Style.RESET_ALL}")
             else:
-                safe_print(f"{Fore.RED}[Dead] {tag[:15]}.. -> Core timeout (port not open){Style.RESET_ALL}")
+                safe_print(f"{Fore.RED}[Dead] {tag[:15]}.. -> Core timeout{Style.RESET_ALL}")
             
             kill_core(proc)
             try: os.remove(configName)
@@ -846,15 +930,22 @@ def Checker(proxyList, localPort, testDomain, timeOut, t2exec, t2kill):
             continue
             
         ping, error_reason = check_connection(localPort, testDomain, timeOut)
-        
+        speed = 0.0
+
         if ping:
-            safe_print(f"{Fore.GREEN}[LIVE] {ping}ms | {tag}{Style.RESET_ALL}")
-            liveProxy.append((url, ping))
+            if checkSpeed:
+                safe_print(f"[blue][TEST][/] Measuring speed for {tag[:15]}...")
+                speed = check_speed_download(localPort, speedUrl, timeout=10)
+                safe_print(f"[green][LIVE][/] {ping}ms | [bold cyan]{speed} Mbps[/] | {tag}")
+            else:
+                safe_print(f"[green][LIVE][/] {ping}ms | {tag}")
+            
+            liveProxy.append((url, ping, speed))
         else:
             short_err = str(error_reason)
             if "SOCKSHTTPSConnectionPool" in short_err: short_err = "Conn Error"
             elif "Read timed out" in short_err: short_err = "Timeout"
-            safe_print(f"{Fore.YELLOW}[Dead] {tag[:15]}.. -> {short_err}{Style.RESET_ALL}")
+            safe_print(f"[yellow][Dead][/] {tag[:15]}.. -> [dim]{short_err}[/]")
 
         kill_core(proc)
         time.sleep(t2kill)
@@ -875,12 +966,12 @@ def run_logic(args):
                  break
     
     if not CORE_PATH:
-        safe_print(f"{Fore.RED}\n[ERROR] Ядро (xray/v2ray) не найдено! Убедитесь, что файл рядом.{Style.RESET_ALL}")
+        safe_print(f"[bold red]\n[ERROR] Ядро (xray/v2ray) не найдено! Убедитесь, что файл рядом.[/]")
         return
         
-    safe_print(f"Core detected: {CORE_PATH}")
+    safe_print(f"[dim]Core detected: {CORE_PATH}[/]")
 
-    safe_print(f"{Fore.YELLOW}>> Очистка зависших процессов ядра...{Style.RESET_ALL}")
+    safe_print(f"[yellow]>> Очистка зависших процессов ядра...[/]")
     killed_count = 0
     target_names = [os.path.basename(CORE_PATH).lower(), "xray.exe", "v2ray.exe", "xray", "v2ray"]
     
@@ -892,9 +983,9 @@ def run_logic(args):
         except: pass
     
     if killed_count > 0:
-        safe_print(f"{Fore.GREEN}>> Убито старых процессов: {killed_count}{Style.RESET_ALL}")
+        safe_print(f"[green]>> Убито старых процессов: {killed_count}[/]")
     
-    time.sleep(1)
+    time.sleep(0.5)
     
     lines = set()
     total_found_raw = 0
@@ -902,32 +993,36 @@ def run_logic(args):
     if args.file:
         fpath = args.file.strip('"')
         if os.path.exists(fpath):
-            safe_print(f"{Fore.CYAN}>> Чтение файла: {fpath}{Style.RESET_ALL}")
+            safe_print(f"[cyan]>> Чтение файла: {fpath}[/]")
             with open(fpath, 'r', encoding='utf-8', errors='ignore') as f:
                 parsed, count = parse_content(f.read())
                 total_found_raw += count
                 lines.update(parsed)
         else:
-            safe_print(f"{Fore.RED}Файл не найден: {fpath}{Style.RESET_ALL}")
+            safe_print(f"[bold red]Файл не найден: {fpath}[/]")
 
     if args.url:
         links = fetch_url(args.url)
         lines.update(links)
 
     if AGGREGATOR_AVAILABLE and getattr(args, 'agg', False):
-        safe_print(f"{Fore.CYAN}>> Запуск агрегатора через CLI...{Style.RESET_ALL}")
+        safe_print(f"[cyan]>> Запуск агрегатора через CLI...[/]")
         sources_map = GLOBAL_CFG.get("sources", {})
         cats = args.agg_cats if args.agg_cats else list(sources_map.keys())
         kws = args.agg_filter if args.agg_filter else []
         
         try:
-            agg_links = aggregator.get_aggregated_links(sources_map, cats, kws, log_func=safe_print)
+            try:
+                agg_links = aggregator.get_aggregated_links(sources_map, cats, kws, log_func=safe_print, console=console)
+            except TypeError:
+                agg_links = aggregator.get_aggregated_links(sources_map, cats, kws, log_func=safe_print)
+                
             lines.update(agg_links)
         except Exception as e:
-            safe_print(f"{Fore.RED}Ошибка агрегатора CLI: {e}{Style.RESET_ALL}")
+            safe_print(f"[bold red]Ошибка агрегатора CLI: {e}[/]")
 
     if hasattr(args, 'direct_list') and args.direct_list:
-        safe_print(f"{Fore.CYAN}>> Получено из агрегатора: {len(args.direct_list)} шт.{Style.RESET_ALL}")
+        safe_print(f"[cyan]>> Получено из агрегатора: {len(args.direct_list)} шт.[/]")
         parsed_agg, _ = parse_content("\n".join(args.direct_list))
         lines.update(parsed_agg)
 
@@ -941,12 +1036,12 @@ def run_logic(args):
     if total_found_raw > 0:
         duplicates = total_found_raw - len(full)
         if duplicates > 0:
-            safe_print(f"{Fore.YELLOW}Найдено: {total_found_raw}. Дубликатов: {duplicates}. К проверке: {len(full)}{Style.RESET_ALL}")
+            safe_print(f"[yellow]Найдено: {total_found_raw}. Дубликатов: {duplicates}. К проверке: {len(full)}[/]")
         else:
-             safe_print(f"{Fore.CYAN}Загружено прокси: {len(full)}{Style.RESET_ALL}")
+             safe_print(f"[cyan]Загружено прокси: {len(full)}[/]")
     
     if not full:
-        safe_print(f"{Fore.RED}Нет прокси для проверки.{Style.RESET_ALL}")
+        safe_print(f"[bold red]Нет прокси для проверки.[/]")
         return
 
     if args.shuffle: random.shuffle(full)
@@ -963,55 +1058,137 @@ def run_logic(args):
     chunks = list(split_list(full, threads))
     results = []
     
-    safe_print(f"{Fore.MAGENTA}Запуск {threads} потоков...{Style.RESET_ALL}\n")
+    console.print(f"\n[magenta]Запуск {threads} потоков... (SpeedCheck: {args.speed_check}, Sort: {args.sort_by})[/]")
 
-    with ThreadPoolExecutor(max_workers=threads) as executor:
-        futures = []
-        for i in range(threads):
-            if i < len(chunks) and chunks[i]:
-                futures.append(executor.submit(Checker, chunks[i], ports[i], args.domain, args.timeout, args.t2exec, args.t2kill))
+    progress_columns = [
+        SpinnerColumn(style="bold yellow"),
+        TextColumn("[progress.description]{task.description}"),
+        BarColumn(bar_width=40, style="dim", complete_style="green", finished_style="bold green"),
+        TextColumn("[progress.percentage]{task.percentage:>3.0f}%"),
+        TimeElapsedColumn(),
+        TextColumn("•"),
+        TimeRemainingColumn(),
+    ]
+
+    with Progress(*progress_columns, console=console, transient=False) as progress:
+        task_id = progress.add_task("[cyan]Checking proxies...", total=len(full))
         
-        try:
-            for f in as_completed(futures):
-                results.extend(f.result())
-        except KeyboardInterrupt:
-            CTRL_C = True
-            safe_print(f"\n{Fore.RED}!!! Остановка по CTRL+C !!!{Style.RESET_ALL}")
-            executor.shutdown(wait=False)
+        with ThreadPoolExecutor(max_workers=threads) as executor:
+            futures = []
+            for i in range(threads):
+                if i < len(chunks) and chunks[i]:
+                    futures.append(executor.submit(
+                        Checker, chunks[i], ports[i], args.domain, args.timeout, 
+                        args.t2exec, args.t2kill, args.speed_check, args.speed_test_url, args.sort_by
+                    ))
+            
+            try:
+                for f in as_completed(futures):
+                    chunk_result = f.result()
+                    results.extend(chunk_result)
+                    progress.advance(task_id, advance=len(chunk_result))
+                    
+            except KeyboardInterrupt:
+                CTRL_C = True
+                safe_print(f"\n[bold red]!!! Остановка по CTRL+C !!![/]")
+                executor.shutdown(wait=False)
 
-    results.sort(key=lambda x: x[1])
+    if args.sort_by == "speed":
+        results.sort(key=lambda x: x[2], reverse=True)
+        safe_print(f"\n[cyan]>> Отсортировано по СКОРОСТИ (по убыванию)[/]")
+    else:
+        results.sort(key=lambda x: x[1])
+        safe_print(f"\n[cyan]>> Отсортировано по ПИНГУ (по возрастанию)[/]")
     
     with open(args.output, 'w', encoding='utf-8') as f:
         for r in results:
             f.write(r[0] + '\n')
+
+    if results:
+        table = Table(title=f"Результаты (Топ 15 из {len(results)})", box=box.ROUNDED)
+        table.add_column("Ping", justify="right", style="green")
+        
+        if args.speed_check:
+            table.add_column("Speed (Mbps)", justify="right", style="bold cyan")
             
-    safe_print(f"\n{Fore.LIGHTGREEN_EX}Готово! Рабочих: {len(results)}{Style.RESET_ALL}")
-    safe_print(f"{Fore.LIGHTGREEN_EX}Результат сохранен в: {Style.BRIGHT}{args.output}{Style.RESET_ALL}")
+        table.add_column("Tag / Protocol", justify="left", overflow="fold")
+
+        for r in results[:15]:
+            tag_display = get_proxy_tag(r[0])
+            if len(tag_display) > 50: tag_display = tag_display[:47] + "..."
+            
+            if args.speed_check:
+                table.add_row(f"{r[1]} ms", f"{r[2]}", tag_display)
+            else:
+                table.add_row(f"{r[1]} ms", tag_display)
+
+        console.print(table)
+            
+    safe_print(f"\n[bold green]Готово! Рабочих: {len(results)}[/]")
+    safe_print(f"[bold green]Результат сохранен в: [white]{args.output}[/]")
 
 def print_banner():
-    os.system('cls' if os.name == 'nt' else 'clear')
-    print(Fore.CYAN + LOGO_ASCII + Style.RESET_ALL)
-    safe_print(Fore.CYAN + "                 MK_XRAYchecker by mkultra69 with HATE" + Style.RESET_ALL)
-    safe_print(f"{Fore.MAGENTA}                      https://t.me/MKextera{Style.RESET_ALL}")
-    print(Fore.LIGHTBLACK_EX + "─"*75 + Style.RESET_ALL)
+    console.clear()
+    
+    logo_str = BACKUP_LOGO
+    font_name = "default"
+
+    if text2art:
+        try:
+            font_name = random.choice(LOGO_FONTS)
+            logo_str = text2art("Xchecker", font=font_name, chr_ignore=True)
+        except Exception:
+            logo_str = BACKUP_LOGO
+
+    if not logo_str or not logo_str.strip():
+        logo_str = BACKUP_LOGO
+
+    logo_text = Text(logo_str, style="cyan bold", no_wrap=True, overflow="crop")
+    
+    panel = Panel(
+        logo_text,
+        title=f"[bold magenta]MK_XRAYchecker[/] [dim](font: {font_name})[/]",
+        subtitle="[bold red]by mkultra69 with HATE[/]",
+        border_style="cyan",
+        box=box.DOUBLE,
+        expand=False, 
+        padding=(1, 2)
+    )
+    
+    console.print(panel, justify="center")
+    console.print("[dim]GitHub: https://github.com/MKultra6969 | Telegram: https://t.me/MKextera[/]", justify="center")
+    console.print("─"*75, style="dim", justify="center")
+    
+    try:
+        MAIN_LOGGER.log("MK_XRAYchecker by mkultra69 with HATE")
+        MAIN_LOGGER.log("https://t.me/MKextera")
+    except: pass
 
 def interactive_menu():
     while True:
         print_banner()
-        print(f"{Fore.LIGHTWHITE_EX} [ ИСТОЧНИК ]{Style.RESET_ALL}")
-        print(f"  {Fore.GREEN}1.{Style.RESET_ALL} Загрузить из файла (.txt)")
-        print(f"  {Fore.GREEN}2.{Style.RESET_ALL} Загрузить по ссылке (URL)")
-        print(f"  {Fore.GREEN}3.{Style.RESET_ALL} Перепроверить ({GLOBAL_CFG['output_file']})")
+        
+        table = Table(show_header=True, header_style="bold magenta", box=box.ROUNDED, expand=True)
+        table.add_column("№", style="cyan", width=4, justify="center")
+        table.add_column("Действие", style="white")
+        table.add_column("Описание", style="dim")
+
+        table.add_row("1", "Файл", "Загрузить прокси из .txt файла")
+        table.add_row("2", "Ссылка", "Загрузить прокси по URL")
+        table.add_row("3", "Перепроверка", f"Проверить заново {GLOBAL_CFG['output_file']}")
         
         if AGGREGATOR_AVAILABLE:
-            print(f"  {Fore.CYAN}4. АГРЕГАТОР + ЧЕКЕР (Скачать и проверить){Style.RESET_ALL}")
+            table.add_row("4", "Агрегатор", "Скачать базы, объединить и проверить")
         
-        print(f"\n{Fore.LIGHTWHITE_EX} [ ДЕЙСТВИЕ ]{Style.RESET_ALL}")
-        print(f"  {Fore.RED}0.{Style.RESET_ALL} Выход")
-        print(Fore.LIGHTBLACK_EX + "─"*75 + Style.RESET_ALL)
+        table.add_row("0", "Выход", "Закрыть программу")
         
-        ch = input(f"{Fore.YELLOW} > Выбор: {Style.RESET_ALL}").strip()
+        console.print(table)
         
+        ch = Prompt.ask("[bold yellow]>[/] Выберите действие", choices=["0", "1", "2", "3", "4"] if AGGREGATOR_AVAILABLE else ["0", "1", "2", "3"])
+        
+        if ch == '0':
+            sys.exit()
+
         defaults = {
             "file": None, "url": None, "reuse": False,
             "domain": GLOBAL_CFG['test_domain'],
@@ -1025,64 +1202,60 @@ def interactive_menu():
             "shuffle": GLOBAL_CFG['shuffle'], 
             "number": None,
             "direct_list": None,
+            "speed_check": GLOBAL_CFG['check_speed'],
+            "speed_test_url": GLOBAL_CFG['speed_test_url'],
+            "sort_by": GLOBAL_CFG['sort_by'],
             "menu": True
         }
         
-        if ch == '0':
-            sys.exit()
-        
         if ch == '1':
-            print()
-            f_input = input(f"{Fore.CYAN} [?] Путь к файлу: {Style.RESET_ALL}").strip('"')
-            if not f_input: continue
-            defaults["file"] = f_input
+            defaults["file"] = Prompt.ask("[cyan][?][/] Путь к файлу").strip('"')
+            if not defaults["file"]: continue
             
         elif ch == '2':
-            print()
-            u_input = input(f"{Fore.CYAN} [?] URL ссылки: {Style.RESET_ALL}").strip()
-            if not u_input: continue
-            defaults["url"] = u_input
+            defaults["url"] = Prompt.ask("[cyan][?][/] URL ссылки").strip()
+            if not defaults["url"]: continue
             
         elif ch == '3':
             defaults["reuse"] = True
             
-            
         elif ch == '4' and AGGREGATOR_AVAILABLE:
-            print(f"\n{Fore.CYAN}--- Настройки Агрегатора ---{Style.RESET_ALL}")
-            print(f"Доступные категории: {', '.join(GLOBAL_CFG.get('sources', {}).keys())}")
-            cats = input("Введите категории (пример: 1 2): ").split()
-            kws = input("Ключевые слова (пример: vless reality): ").split()
+            console.print(Panel(f"Доступные категории: [green]{', '.join(GLOBAL_CFG.get('sources', {}).keys())}[/]", title="Агрегатор"))
+            cats = Prompt.ask("Введите категории (через пробел)", default="1 2").split()
+            kws = Prompt.ask("Фильтр (ключевые слова через пробел)", default="").split()
             
             sources_map = GLOBAL_CFG.get("sources", {})
-            
             try:
-                raw_links = aggregator.get_aggregated_links(sources_map, cats, kws, log_func=safe_print)
+                raw_links = aggregator.get_aggregated_links(sources_map, cats, kws, console=console)
                 if not raw_links:
-                    safe_print(f"{Fore.RED}Ничего не найдено агрегатором.{Style.RESET_ALL}")
+                    safe_print("[bold red]Ничего не найдено агрегатором.[/]")
                     time.sleep(2)
                     continue
                 defaults["direct_list"] = raw_links
             except Exception as e:
-                safe_print(f"{Fore.RED}Ошибка агрегатора: {e}{Style.RESET_ALL}")
+                safe_print(f"[bold red]Ошибка агрегатора: {e}[/]")
                 continue
 
-  
-
+        if Confirm.ask("Включить тест скорости?", default=False):
+            defaults["speed_check"] = True
+            defaults["sort_by"] = "speed"
         else:
-            continue
+            defaults["speed_check"] = False
+            defaults["sort_by"] = "ping"
 
         args = SimpleNamespace(**defaults)
         
-        safe_print(f"\n{Fore.YELLOW}>>> Инициализация проверки...{Style.RESET_ALL}")
+        safe_print("\n[yellow]>>> Инициализация проверки...[/]")
         time.sleep(0.5)
         
         try:
             run_logic(args)
         except Exception as e:
-            safe_print(f"{Fore.RED}CRITICAL ЕГГОГ: {e}{Style.RESET_ALL}")
+            safe_print(f"[bold red]CRITICAL ERROR: {e}[/]")
+            import traceback
+            traceback.print_exc()
         
-        print(f"\n{Fore.YELLOW}Нажмите Enter чтобы вернуться в меню...{Style.RESET_ALL}")
-        input()
+        Prompt.ask("\n[bold]Нажмите Enter чтобы вернуться в меню...[/]", password=False)
 
 def main():
     parser = argparse.ArgumentParser()
@@ -1104,6 +1277,9 @@ def main():
     parser.add_argument("--agg", action="store_true", help="Запустить агрегатор")
     parser.add_argument("--agg-cats", nargs='+', help="Категории для агрегатора (например: 1 2)")
     parser.add_argument("--agg-filter", nargs='+', help="Ключевые слова для фильтра (например: vless reality)")
+    parser.add_argument("--speed", action="store_true", dest="speed_check", help="Включить тест скорости")
+    parser.add_argument("--sort", choices=["ping", "speed"], default=GLOBAL_CFG['sort_by'], dest="sort_by", help="Метод сортировки")
+    parser.add_argument("--speed-url", default=GLOBAL_CFG['speed_test_url'], dest="speed_test_url")
 
     if len(sys.argv) == 1:
         interactive_menu()

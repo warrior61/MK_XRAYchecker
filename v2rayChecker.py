@@ -19,7 +19,7 @@
 # ║                                  mk69.su                                ║
 # +═════════════════════════════════════════════════════════════════════════+
 # +═════════════════════════════════════════════════════════════════════════+
-# ║                           VERSION 0.8 unstable                          ║
+# ║                           VERSION 0.9.6 fixes                           ║
 # ║             В случае багов/недочётов создайте issue на github           ║
 # ║                                                                         ║
 # +═════════════════════════════════════════════════════════════════════════+
@@ -172,6 +172,17 @@ DEFAULT_CONFIG = {
     "speed_connect_timeout": 5,   # Макс. время (сек) на подключение перед скачиванием (пинг 4000мс, скрипт ждёт 5000мс, значит скорость будет замеряна.)
     "speed_max_mb": 10,           # Лимит скачивания в МБ (чтобы не тратить трафик)
     "speed_min_kb": 1,            # Минимальный порог данных (в Килобайтах). Если прокси скачал меньше этого, скорость будет равной 0.0
+
+    "speed_targets": [
+        "https://speed.cloudflare.com/__down?bytes=20000000",              # Cloudflare (Global)
+        "https://proof.ovh.net/files/100Mb.dat",                           # OVH (Europe/Global)
+        "http://speedtest.tele2.net/100MB.zip",                            # Tele2 (Very stable)
+        "https://speed.hetzner.de/100MB.bin",                              # Hetzner (Germany)
+        "https://mirror.leaseweb.com/speedtest/100mb.bin",                 # Leaseweb (NL)
+        "http://speedtest-ny.turnkeyinternet.net/100mb.bin",               # USA
+        "https://yandex.ru/internet/api/v0/measure/download?size=10000000" # Yandex (RU/CIS)
+    ],
+
 
     "sources": {}, # Переезд в отделный .json
 }
@@ -733,6 +744,11 @@ def create_config_file(proxy_url, local_port, work_dir):
     if not proxy_conf: 
         return None, "Parsing Failed"
 
+    if not proxy_conf.get("port") or not proxy_conf.get("address"):
+        return None, "Port or Address missing"
+
+    streamSettings = {}
+
     streamSettings = {}
     
     if proxy_conf["protocol"] in ["vless", "vmess", "trojan"]:
@@ -905,43 +921,67 @@ def check_connection(local_port, domain, timeout):
         return False, str(e)
     
 def check_speed_download(local_port, url_file, timeout=10, conn_timeout=5, max_mb=5, min_kb=1):
+    # Получаем список целей из конфига или используем переданный url_file как приоритет
+    targets = GLOBAL_CFG.get("speed_targets", [])
+    
+    # Если передан конкретный URL (через аргументы), ставим его первым
+    pool = [url_file] + targets if url_file else list(targets)
+    # Перемешиваем дефолтный пул, чтобы потоки не долбили один сервер (кроме первого, если он задан)
+    if not url_file: random.shuffle(pool)
+    
+    # Очищаем пустые
+    pool = [u for u in pool if u]
+    if not pool: return 0.0
+
     proxies = {
         'http': f'socks5://127.0.0.1:{local_port}',
         'https': f'socks5://127.0.0.1:{local_port}'
     }
+    
     headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
+        "Accept": "*/*",
+        "Connection": "keep-alive"
     }
-    try:
-        with requests.get(url_file, proxies=proxies, headers=headers, stream=True, timeout=(conn_timeout, timeout), verify=False) as r:
-            r.raise_for_status()
-            
-            start_time = time.time()
-            total_bytes = 0
-            limit_bytes = max_mb * 1024 * 1024
-            
-            try:
-                for chunk in r.iter_content(chunk_size=8192):
+
+    limit_bytes = max_mb * 1024 * 1024
+    
+    for target_url in pool:
+        try:
+            with requests.get(target_url, proxies=proxies, headers=headers, stream=True, 
+                              timeout=(conn_timeout, timeout), verify=False) as r:
+                
+                if r.status_code >= 400:
+                    continue
+
+                start_time = time.time()
+                total_bytes = 0
+                
+                for chunk in r.iter_content(chunk_size=32768):
                     if chunk:
                         total_bytes += len(chunk)
                     
-                    if time.time() - start_time > timeout or total_bytes >= limit_bytes:
+                    curr_time = time.time()
+                    if (curr_time - start_time) > timeout or total_bytes >= limit_bytes:
                         break
-            except Exception:
-                pass
-            
-            duration = time.time() - start_time
-            if duration <= 0.1: duration = 0.1
-            
-            if total_bytes < (min_kb * 1024):
-                return 0.0
                 
-            speed_bps = total_bytes / duration
-            speed_mbps = speed_bps / 125000 
-            
-            return round(speed_mbps, 2)
-    except Exception:
-        return 0.0
+                duration = time.time() - start_time
+                if duration <= 0.1: duration = 0.1
+
+                if total_bytes < (min_kb * 1024):
+                    if duration > (timeout * 0.8):
+                        return 0.0
+                    continue
+
+                speed_bps = total_bytes / duration
+                speed_mbps = speed_bps / 125000
+                
+                return round(speed_mbps, 2)
+
+        except (requests.exceptions.ConnectTimeout, requests.exceptions.ReadTimeout, requests.exceptions.ConnectionError):
+            continue
+        except Exception:
+            pass
 
 def Checker(proxyList, localPort, testDomain, timeOut, t2exec, t2kill, checkSpeed=False, speedUrl="", sortBy="ping", speedCfg=None, speedSemaphore=None):
     liveProxy = []
@@ -1004,7 +1044,12 @@ def Checker(proxyList, localPort, testDomain, timeOut, t2exec, t2kill, checkSpee
                         min_kb=speedCfg['min_kb']
                     )
                 
-                safe_print(f"[green][LIVE][/] {ping}ms | [bold cyan]{speed} Mbps[/] | {tag}")
+                sp_color = "red"
+                if speed > 5: sp_color = "yellow"
+                if speed > 15: sp_color = "green"
+                if speed > 50: sp_color = "bold cyan"
+
+                safe_print(f"[green][LIVE][/] {ping}ms | [{sp_color}]{speed} Mbps[/] | {tag}")
             else:
                 safe_print(f"[green][LIVE][/] {ping}ms | {tag}")
             
@@ -1158,21 +1203,25 @@ def run_logic(args):
         task_id = progress.add_task("[cyan]Checking proxies...", total=len(full))
         
         with ThreadPoolExecutor(max_workers=threads) as executor:
-            futures = []
+            future_to_count = {}
+            
             for i in range(threads):
                 if i < len(chunks) and chunks[i]:
-                    futures.append(executor.submit(
+                    ft = executor.submit(
                         Checker, chunks[i], ports[i], args.domain, args.timeout, 
                         args.t2exec, args.t2kill, args.speed_check, args.speed_test_url, args.sort_by,
                         speed_config_map,
                         speed_semaphore
-                    ))
+                    )
+                    future_to_count[ft] = len(chunks[i])
             
             try:
-                for f in as_completed(futures):
+                for f in as_completed(future_to_count):
                     chunk_result = f.result()
                     results.extend(chunk_result)
-                    progress.advance(task_id, advance=len(chunk_result))
+                    
+                    processed_count = future_to_count[f]
+                    progress.advance(task_id, advance=processed_count)
                     
             except KeyboardInterrupt:
                 CTRL_C = True
@@ -1250,6 +1299,24 @@ def print_banner():
         MAIN_LOGGER.log("https://t.me/MKextera")
     except: pass
 
+def kill_all_cores_manual():
+    console.print("[yellow]>> Поиск и принудительная остановка процессов ядра...[/]")
+    killed_count = 0
+    target_names = ["xray.exe", "v2ray.exe", "xray", "v2ray", "wxray.exe", "wxray"]
+    
+    for proc in psutil.process_iter(['pid', 'name']):
+        try:
+            if proc.info['name'] and proc.info['name'].lower() in target_names:
+                proc.kill()
+                killed_count += 1
+        except: pass
+    
+    if killed_count > 0:
+        console.print(f"[bold green]>> Успешно убито {killed_count} зависших процессов.[/]")
+    else:
+        console.print("[dim]>> Активных процессов ядра не найдено.[/]")
+    time.sleep(1.5)
+
 def interactive_menu():
     while True:
         print_banner()
@@ -1266,11 +1333,13 @@ def interactive_menu():
         if AGGREGATOR_AVAILABLE:
             table.add_row("4", "Агрегатор", "Скачать базы, объединить и проверить")
         
+        table.add_row("5", "Сброс ядер", "Убить все процессы xray")
         table.add_row("0", "Выход", "Закрыть программу")
         
         console.print(table)
         
-        ch = Prompt.ask("[bold yellow]>[/] Выберите действие", choices=["0", "1", "2", "3", "4"] if AGGREGATOR_AVAILABLE else ["0", "1", "2", "3"])
+        valid_choices = ["0", "1", "2", "3", "4", "5"] if AGGREGATOR_AVAILABLE else ["0", "1", "2", "3", "5"]
+        ch = Prompt.ask("[bold yellow]>[/] Выберите действие", choices=valid_choices)
         
         if ch == '0':
             sys.exit()
@@ -1321,6 +1390,10 @@ def interactive_menu():
             except Exception as e:
                 safe_print(f"[bold red]Ошибка агрегатора: {e}[/]")
                 continue
+            
+        elif ch == '5':
+            kill_all_cores_manual()
+            continue
 
         if Confirm.ask("Включить тест скорости?", default=False):
             defaults["speed_check"] = True

